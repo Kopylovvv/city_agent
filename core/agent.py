@@ -130,7 +130,7 @@ def run_agent(user_query: str) -> str:
                 "content": result
             })
 
-        # второй запрос к модели - просим сформировать финальный ответ с учетом данных от функций
+        # второй запрос к модели - финальный ответ с учетом данных от функций
         final_response = client.chat.completions.create(
             model=model_name,
             messages=messages
