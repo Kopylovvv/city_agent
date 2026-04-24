@@ -3,7 +3,7 @@ import json
 from groq import Groq
 from dotenv import load_dotenv
 
-from core.tools import get_nearby_places
+from core.tools import get_nearby_places, geocode_place
 from core.optimizer import optimize_route
 
 load_dotenv()
@@ -14,6 +14,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "geocode_place",
+            "description": "ищет gps координаты по текстовому названию места или адресу",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "place_name": {"type": "string",
+                                   "description": "название места и город, например 'эрмитаж спб' или 'галерея аэропорт москва'"}
+                },
+                "required": ["place_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_nearby_places",
             "description": "ищет интересные места (кафе, музеи, парки) вокруг заданных координат",
             "parameters": {
@@ -21,9 +36,12 @@ TOOLS = [
                 "properties": {
                     "lat": {"type": "number", "description": "широта"},
                     "lon": {"type": "number", "description": "долгота"},
-                    "place_type": {"type": "string",
-                                   "description": "тип места на английском, например 'cafe', 'museum', 'monument'"},
-                    "radius": {"type": "integer", "description": "радиус поиска в метрах, по умолчанию 2000"}
+                    "place_type": {
+                        "type": "string",
+                        "description": "строгий тип места на английском. другие слова использовать запрещено",
+                        "enum": ["cafe", "restaurant", "fast_food", "museum", "monument", "park", "attraction"]
+                    },
+                    "radius": {"type": "integer", "description": "радиус поиска в метрах, обычно 2000"}
                 },
                 "required": ["lat", "lon", "place_type"]
             }
@@ -39,7 +57,7 @@ TOOLS = [
                 "properties": {
                     "places": {
                         "type": "array",
-                        "description": "список словарей с ключами name, lat, lon",
+                        "description": "список словарей с ключами name, lat, lon, полученный из get_nearby_places",
                         "items": {"type": "object"}
                     }
                 },
@@ -50,16 +68,30 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """
-ты умный туристический гид
-твоя цель - помочь пользователю составить идеальный пеший маршрут
-ты должен использовать доступные инструменты для поиска реальных мест и оптимизации пути
+Ты — точный и строгий AI-логист. 
+Твоя единственная задача — строить оптимальные маршруты ИСКЛЮЧИТЕЛЬНО на основе данных от твоих инструментов.
 
-правила:
-1. если пользователь не дал координаты, попроси его уточнить где он находится
-2. используй get_nearby_places чтобы найти нужные локации
-3. обязательно пропусти найденные места через optimize_route
-4. в финальном ответе красиво распиши маршрут по шагам
-5. обязательно укажи сколько километров удалось сэкономить (сравни baseline_km и optimized_km и выведи saved_km)
+АБСОЛЮТНЫЕ ПРАВИЛА (ЗАПРЕТ НА ГАЛЛЮЦИНАЦИИ):
+1. Запрещено выдумывать названия мест, адреса или координаты. 
+2. Используй только те локации, которые вернул инструмент `get_nearby_places`.
+3. Если места не найдены, прямо скажи об этом и не пытайся ничего сочинять.
+
+АЛГОРИТМ РАБОТЫ (ЦЕПОЧКА ВЫЗОВОВ):
+Шаг 1. Если пользователь назвал место без координат, СНАЧАЛА вызови `geocode_place`. Дождись результата.
+Шаг 2. Получив координаты, вызови `get_nearby_places` для поиска нужных объектов. Дождись результата.
+Шаг 3. Как только получишь JSON со списком реальных мест, СРАЗУ передай их в `optimize_route`.
+Шаг 4. Сформируй финальный ответ по шаблону ниже.
+
+ШАБЛОН ФИНАЛЬНОГО ОТВЕТА (ОТВЕЧАЙ СТРОГО ТАК):
+Привет! Я составил для вас оптимальный маршрут:
+1. [Название места] 
+2. [Название места]
+... и так далее.
+
+Статистика маршрута:
+- Если идти случайно (baseline): [baseline_km] км
+- Оптимизированный путь: [optimized_km] км
+Вы сэкономите: [saved_km] км!
 """
 
 
@@ -73,70 +105,67 @@ def run_agent(user_query: str) -> str:
         return "ошибка: не найден GROQ_API_KEY в файле .env"
 
     client = Groq(api_key=api_key)
-
-    # модель llama 3 на 8 миллиардов параметров
-    # можно поменять на {llama3-70b-8192}, если нужна модель поумнее и есть подходящее железо)))
-    model_name = "llama3-8b-8192"
+    model_name = "llama-3.3-70b-versatile"
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_query}
     ]
 
-    try:
-        # первый запрос к модели
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            max_tokens=2048
-        )
+    # даем агенту 5 шагов чтобы он успел сходить в геокодер, потом за местами, потом в оптимизатор
+    for iteration in range(5):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.0 # чтобы не придумывал места и улицы
+            )
 
-        response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
+            response_message = response.choices[0].message
 
-        # если модель решила, что инструменты не нужны (например просто здоровается)
-        if not tool_calls:
-            return response_message.content
+            # если модель решила что инструментов больше не надо и выдала текст
+            if not response_message.tool_calls:
+                return response_message.content
 
-        # если модель решила вызвать инструменты
-        messages.append(response_message)
+            # запоминаем вызов в истории
+            messages.append(response_message)
 
-        # обрабатываем каждый вызов инструмента
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
+            # обрабатываем запросы к питоновским функциям
+            for tool_call in response_message.tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
 
-            if function_name == "get_nearby_places":
-                result = get_nearby_places(
-                    lat=function_args.get("lat"),
-                    lon=function_args.get("lon"),
-                    place_type=function_args.get("place_type"),
-                    radius=function_args.get("radius", 2000)
-                )
-            elif function_name == "optimize_route":
-                # перевод optimize_route в строку из словаря
-                raw_result = optimize_route(places=function_args.get("places"))
-                result = json.dumps(raw_result, ensure_ascii=False)
-            else:
-                result = f"ошибка: неизвестный инструмент {function_name}"
+                print(f"[Агент вызывает: {function_name}]")
 
-            # отправляем результат работы функции обратно модели
-            messages.append({
-                "tool_call_id": tool_call.id,
-                "role": "tool",
-                "name": function_name,
-                "content": result
-            })
+                if function_name == "geocode_place":
+                    result = geocode_place(place_name=function_args.get("place_name"))
 
-        # второй запрос к модели - финальный ответ с учетом данных от функций
-        final_response = client.chat.completions.create(
-            model=model_name,
-            messages=messages
-        )
+                elif function_name == "get_nearby_places":
+                    result = get_nearby_places(
+                        lat=function_args.get("lat"),
+                        lon=function_args.get("lon"),
+                        place_type=function_args.get("place_type"),
+                        radius=function_args.get("radius", 2000)
+                    )
 
-        return final_response.choices[0].message.content
+                elif function_name == "optimize_route":
+                    raw_result = optimize_route(places=function_args.get("places"))
+                    result = json.dumps(raw_result, ensure_ascii=False)
 
-    except Exception as e:
-        return f"ошибка агента: {str(e)}"
+                else:
+                    result = json.dumps({"error": "неизвестный инструмент"})
+
+                # скармливаем результат обратно модели
+                messages.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": result
+                })
+
+        except Exception as e:
+            return f"ошибка в мозгах агента: {str(e)}"
+
+    return "Агент превысил лимит раздумий. Попробуй задать вопрос проще."
